@@ -128,7 +128,7 @@ def train_one_epoch(
 
             for t in new_targets:
                 if "boxes" in t:
-                    t["circles"] = boxes_to_circles(t["boxes"])
+                    t["circles"] = circle_ops.boxes_to_circles(t["boxes"])
 
             with autocast(**get_autocast_args(args)):
                 outputs = model(new_samples, new_targets)

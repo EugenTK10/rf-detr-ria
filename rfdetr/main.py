@@ -35,6 +35,8 @@ import numpy as np
 import torch
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 
 import rfdetr.util.misc as utils
 from rfdetr.datasets import build_dataset, get_coco_api_from_dataset
@@ -499,7 +501,7 @@ class Model:
 
         if args.run_test:
             best_state_dict = torch.load(output_dir / 'checkpoint_best_total.pth', map_location='cpu', weights_only=False)['model']
-            model.load_state_dict(best_state_dict)
+            (target := model.module if isinstance(model, DDP) else model).load_state_dict(best_state_dict)
             model.eval()
 
             test_stats, _ = evaluate(
