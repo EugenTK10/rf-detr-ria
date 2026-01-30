@@ -770,6 +770,9 @@ def get_args_parser():
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
+    parser.add_argument('--set_cost_center_l1', default=5.0, type=float)
+    parser.add_argument('--set_cost_radius_l1', default=5.0, type=float)
+    parser.add_argument('--set_cost_circle_iou', default=2.0, type=float)
     
     # Loss
     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
@@ -930,6 +933,14 @@ def populate_args(
     bbox_loss_coef=5,
     giou_loss_coef=2,
     focal_alpha=0.25,
+    set_cost_center_l1 = 5.0,
+    set_cost_radius_l1 = 5.0,
+    set_cost_circle_iou = 2.0,
+    
+    center_loss_coef=5.0,
+    radius_loss_coef=5.0,
+    ciou_loss_coef=2.0,
+    
     aux_loss=True,
     sum_group_losses=False,
     use_varifocal_loss=False,
@@ -1041,6 +1052,12 @@ def populate_args(
         bbox_loss_coef=bbox_loss_coef,
         giou_loss_coef=giou_loss_coef,
         focal_alpha=focal_alpha,
+        set_cost_center_l1=set_cost_center_l1,
+        set_cost_radius_l1=set_cost_radius_l1,
+        set_cost_circle_iou=set_cost_circle_iou,
+        center_loss_coef=center_loss_coef,
+        radius_loss_coef=radius_loss_coef,
+        ciou_loss_coef=ciou_loss_coef,
         aux_loss=aux_loss,
         sum_group_losses=sum_group_losses,
         use_varifocal_loss=use_varifocal_loss,

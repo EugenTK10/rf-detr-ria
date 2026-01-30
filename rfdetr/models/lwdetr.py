@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from rfdetr.util import box_ops
+from rfdetr.util import box_ops, circle_ops
 from rfdetr.util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size,
                        is_dist_avail_and_initialized)
@@ -182,7 +182,9 @@ class LWDETR(nn.Module):
             if self.segmentation_head is not None:
                 outputs_masks = self.segmentation_head(features[0].tensors, hs, samples.tensors.shape[-2:])
 
-            out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+            out = {'pred_logits': outputs_class[-1], 
+                   'pred_boxes': outputs_coord[-1],
+                   'pred_circles': circle_ops.boxes_to_circles(outputs_coord[-1])}
             if self.segmentation_head is not None:
                 out['pred_masks'] = outputs_masks[-1]
             if self.aux_loss:
@@ -202,12 +204,19 @@ class LWDETR(nn.Module):
                 masks_enc = self.segmentation_head(features[0].tensors, [hs_enc,], samples.tensors.shape[-2:], skip_blocks=True)
                 masks_enc = torch.cat(masks_enc, dim=1)
 
+            # Include the pred_circles in the enc_outputs
+            enc_dict = {
+                'pred_logits':  cls_enc,
+                'pred_boxes':   ref_enc,
+                'pred_circles': circle_ops.boxes_to_circles(ref_enc),
+            }
+
             if hs is not None:
-                out['enc_outputs'] = {'pred_logits': cls_enc, 'pred_boxes': ref_enc}
+                out['enc_outputs'] = enc_dict
                 if self.segmentation_head is not None:
                     out['enc_outputs']['pred_masks'] = masks_enc
             else:
-                out = {'pred_logits': cls_enc, 'pred_boxes': ref_enc}
+                out = enc_dict
                 if self.segmentation_head is not None:
                     out['pred_masks'] = masks_enc
 
@@ -255,11 +264,24 @@ class LWDETR(nn.Module):
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         if outputs_masks is not None:
-            return [{'pred_logits': a, 'pred_boxes': b, 'pred_masks': c}
-                    for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], outputs_masks[:-1])]
+            return [
+                {
+                    'pred_logits':  a,
+                    'pred_boxes':   b,
+                    'pred_circles': circle_ops.boxes_to_circles(b),
+                    'pred_masks':   c,
+                }
+                for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], outputs_masks[:-1])
+            ]
         else:
-            return [{'pred_logits': a, 'pred_boxes': b}
-                    for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+            return [
+                {
+                    'pred_logits':  a,
+                    'pred_boxes':   b,
+                    'pred_circles': circle_ops.boxes_to_circles(b),
+                }
+                for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
+            ]
 
     def update_drop_path(self, drop_path_rate, vit_encoder_num_layers):
         """ """
@@ -446,6 +468,53 @@ class SetCriterion(nn.Module):
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
     
+    def loss_circles(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to circle regression: center L1, radius L1, and Circle-IoU loss.
+        targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4].
+        The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+
+        Notes:
+            - This loss converts both predicted and target boxes to circles (cx, cy, r) via
+            `circle_ops.boxes_to_circles(...)`.
+            - Circle IoU is computed for matched pairs only (diagonal of the pairwise IoU matrix).
+
+        Returned losses:
+            - "loss_center_l1": L1 loss on (cx, cy)
+            - "loss_radius_l1": L1 loss on r
+            - "loss_circle_iou": 1 - circle_iou
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        
+        src_boxes = outputs['pred_boxes'][idx]
+        src_circles = circle_ops.boxes_to_circles(src_boxes)  # (cx, cy, r)
+
+        tgt_boxes = torch.cat(
+            [t['boxes'][J] for t, (_, J) in zip(targets, indices)],
+            dim=0
+        ) # [N,4]
+        
+        tgt_circles = circle_ops.boxes_to_circles(tgt_boxes)  # [N,3]
+        
+        # L1 on center (cx, cy)
+        l1_center = F.l1_loss(src_circles[:, :2], tgt_circles[:, :2], reduction='none').sum(-1)
+
+        # L1 on radius (r)
+        l1_radius = F.l1_loss(src_circles[:, 2], tgt_circles[:, 2], reduction='none')
+
+        # compute per-pair IoU
+        ciou_mat, _ = circle_ops.circle_iou(src_circles, tgt_circles)
+        ciou = torch.diag(ciou_mat)  # [N_match]
+        loss_ciou = 1.0 - ciou
+        
+        losses = {}
+        # you will weight these via weight_dict in build_criterion
+        losses['loss_center_l1'] = l1_center.sum() / num_boxes
+        losses['loss_radius_l1'] = l1_radius.sum() / num_boxes
+        losses['loss_circle_iou'] = loss_ciou.sum() / num_boxes
+
+        return losses
+    
     def loss_masks(self, outputs, targets, indices, num_boxes):
         """Compute BCE-with-logits and Dice losses for segmentation masks on matched pairs.
         Expects outputs to contain 'pred_masks' of shape [B, Q, H, W] and targets with key 'masks'.
@@ -522,6 +591,7 @@ class SetCriterion(nn.Module):
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
             'masks': self.loss_masks,
+            'circles': self.loss_circles,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -831,8 +901,13 @@ def build_model(args):
 def build_criterion_and_postprocessors(args):
     device = torch.device(args.device)
     matcher = build_matcher(args)
-    weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
-    weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict = {'loss_ce': args.cls_loss_coef, 
+        'loss_bbox': args.bbox_loss_coef,     
+        'loss_giou': args.giou_loss_coef,
+        'loss_center_l1': args.center_loss_coef,
+        'loss_radius_l1': args.radius_loss_coef,
+        'loss_circle_iou': args.ciou_loss_coef}
+    # weight_dict['loss_giou'] = args.giou_loss_coef
     if args.segmentation_head:
         weight_dict['loss_mask_ce'] = args.mask_ce_loss_coef
         weight_dict['loss_mask_dice'] = args.mask_dice_loss_coef
@@ -845,7 +920,7 @@ def build_criterion_and_postprocessors(args):
             aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'cardinality']
+    losses = ['labels', 'boxes', 'cardinality', 'circles']
     if args.segmentation_head:
         losses.append('masks')
 

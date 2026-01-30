@@ -26,7 +26,8 @@ from torch import nn
 import torch.nn.functional as F
 
 from rfdetr.util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou, batch_sigmoid_ce_loss, batch_dice_loss
-from rfdetr.models.segmentation_head import point_sample
+from rfdetr.util import circle_ops
+from rfdetr.models.segmentation_head import point_sample 
 
 
 class HungarianMatcher(nn.Module):
@@ -37,7 +38,10 @@ class HungarianMatcher(nn.Module):
     """
 
     def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1, focal_alpha: float = 0.25, use_pos_only: bool = False,
-                 use_position_modulated_cost: bool = False, mask_point_sample_ratio: int = 16, cost_mask_ce: float = 1, cost_mask_dice: float = 1):
+                 use_position_modulated_cost: bool = False, mask_point_sample_ratio: int = 16, cost_mask_ce: float = 1, cost_mask_dice: float = 1,
+                 cost_center_l1: float = 1, 
+                 cost_radius_l1: float=1, 
+                 cost_circle_iou: float = 1):
         """Creates the matcher
         Params:
             cost_class: This is the relative weight of the classification error in the matching cost
@@ -49,10 +53,14 @@ class HungarianMatcher(nn.Module):
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
         assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
+        assert cost_class != 0 or cost_center_l1 !=0 or cost_radius_l1 !=0 or cost_circle_iou !=0, "all costs cant be 0"
         self.focal_alpha = focal_alpha
         self.mask_point_sample_ratio = mask_point_sample_ratio
         self.cost_mask_ce = cost_mask_ce
         self.cost_mask_dice = cost_mask_dice
+        self.cost_center_l1 = cost_center_l1
+        self.cost_radius_l1 = cost_radius_l1
+        self.cost_circle_iou = cost_circle_iou
 
     @torch.no_grad()
     def forward(self, outputs, targets, group_detr=1):
@@ -99,6 +107,24 @@ class HungarianMatcher(nn.Module):
         alpha = 0.25
         gamma = 2.0
         
+        # Calculate circle related losses when we have the circles availble 
+        use_circle_costs = (
+            "pred_circles" in outputs
+            and (self.cost_center_l1 != 0 or self.cost_radius_l1 != 0 or self.cost_circle_iou != 0)
+        )
+
+        if use_circle_costs:
+            out_circles = outputs["pred_circles"].flatten(0, 1)  # [P, 3]
+
+            # derive GT circles from GT boxes (same as in loss_circles)
+            tgt_circles = circle_ops.boxes_to_circles(tgt_bbox)             # [T, 3]
+
+            cost_center_l1 = torch.cdist(out_circles[:, :2], tgt_circles[:, :2], p=1)
+            cost_radius_l1 = torch.cdist(out_circles[:, 2:3], tgt_circles[:, 2:3], p=1)
+
+            circle_iou_mat, _ = circle_ops.circle_iou(out_circles, tgt_circles)
+            cost_circle_iou = 1.0 - circle_iou_mat
+        
         # neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
         # pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
         # we refactor these with logsigmoid for numerical stability
@@ -136,7 +162,17 @@ class HungarianMatcher(nn.Module):
         # Final cost matrix
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         if masks_present:
-            C = C + self.cost_mask_ce * cost_mask_ce + self.cost_mask_dice * cost_mask_dice
+            C = C + self.cost_mask_ce * cost_mask_ce + self.cost_mask_dice * cost_mask_dice        
+
+        # Add circle-based terms if available
+        if use_circle_costs:
+            C = (
+                C
+                + self.cost_center_l1 * cost_center_l1
+                + self.cost_radius_l1 * cost_radius_l1
+                + self.cost_circle_iou * cost_circle_iou
+            )    
+        
         C = C.view(bs, num_queries, -1).float().cpu()  # convert to float because bfloat16 doesn't play nicely with CPU
 
         # we assume any good match will not cause NaN or Inf, so we replace them with a large value
@@ -169,11 +205,17 @@ def build_matcher(args):
             focal_alpha=args.focal_alpha,
             cost_mask_ce=args.mask_ce_loss_coef,
             cost_mask_dice=args.mask_dice_loss_coef,
-            mask_point_sample_ratio=args.mask_point_sample_ratio,)
+            mask_point_sample_ratio=args.mask_point_sample_ratio,
+            cost_center_l1=args.set_cost_center_l1,
+            cost_radius_l1=args.set_cost_radius_l1,
+            cost_circle_iou=args.set_cost_circle_iou,)
     else:
         return HungarianMatcher(
             cost_class=args.set_cost_class,
             cost_bbox=args.set_cost_bbox,
             cost_giou=args.set_cost_giou,
             focal_alpha=args.focal_alpha,
-        )
+            cost_center_l1=args.set_cost_center_l1,
+            cost_radius_l1=args.set_cost_radius_l1,
+            cost_circle_iou=args.set_cost_circle_iou,
+            )

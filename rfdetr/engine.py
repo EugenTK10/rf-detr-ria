@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 
 import rfdetr.util.misc as utils
+from rfdetr.util import circle_ops
 from rfdetr.datasets.coco_eval import CocoEvaluator
 from rfdetr.datasets.coco import compute_multi_scale_scales
 
@@ -113,7 +114,7 @@ def train_one_epoch(
             scales = compute_multi_scale_scales(args.resolution, args.expanded_scales, args.patch_size, args.num_windows)
             random.seed(it)
             scale = random.choice(scales)
-            with torch.inference_mode():
+            with torch.no_grad():
                 samples.tensors = F.interpolate(samples.tensors, size=scale, mode='bilinear', align_corners=False)
                 samples.mask = F.interpolate(samples.mask.unsqueeze(1).float(), size=scale, mode='nearest').squeeze(1).bool()
 
@@ -124,6 +125,10 @@ def train_one_epoch(
             new_samples = NestedTensor(new_samples_tensors, samples.mask[start_idx:final_idx])
             new_samples = new_samples.to(device)
             new_targets = [{k: v.to(device) for k, v in t.items()} for t in targets[start_idx:final_idx]]
+
+            for t in new_targets:
+                if "boxes" in t:
+                    t["circles"] = boxes_to_circles(t["boxes"])
 
             with autocast(**get_autocast_args(args)):
                 outputs = model(new_samples, new_targets)
@@ -270,6 +275,12 @@ def evaluate(model, criterion, postprocess, data_loader, base_ds, device, args=N
 
         if args.fp16_eval:
             samples.tensors = samples.tensors.half()
+            
+        # Derive circles from ground-truth boxes for eval loss
+        for t in targets:
+            if "boxes" in t:
+                t["circles"] = circle_ops.boxes_to_circles(t["boxes"])
+
 
         # Add autocast for evaluation
         with autocast(**get_autocast_args(args)):
